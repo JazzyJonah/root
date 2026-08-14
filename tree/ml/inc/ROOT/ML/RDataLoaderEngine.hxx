@@ -22,6 +22,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <numeric>
+#include <valarray>
+#include <string_view>
 
 #include "ROOT/ML/RBatchLoader.hxx"
 #include "ROOT/ML/RClusterLoader.hxx"
@@ -30,6 +33,10 @@
 #include "ROOT/ML/RFlat2DMatrixOperators.hxx"
 #include "ROOT/ML/RSampler.hxx"
 #include "ROOT/RDF/InterfaceUtils.hxx"
+#include "TTree.h"
+#include "ROOT/RDataFrame.hxx"
+#include "ROOT/RNTupleModel.hxx"
+#include "ROOT/RNTupleWriter.hxx"
 
 // Empty namespace to create a hook for the Pythonization
 namespace ROOT::Experimental::ML {
@@ -50,6 +57,7 @@ class RDataLoaderEngine {
 private:
    std::vector<std::string> fCols;
    std::vector<std::size_t> fVecSizes;
+   std::map<std::string, std::size_t> fVecNamesSizes{};
    std::size_t fBatchSize;
    std::size_t fSetSeed;
 
@@ -130,6 +138,16 @@ public:
         fReplacement(replacement)
    {
       fTensorOperators = std::make_unique<RFlat2DMatrixOperators>(fShuffle, fSetSeed);
+
+      int currVectorCol = 0;
+      for(int i = 0; i<cols.size(); i++){
+         auto colName = cols[i];
+         auto colType = fRdfs[0].GetColumnType(colName);
+         if(colType.find("RVec") != std::string::npos) {
+            fVecNamesSizes[colName] = fVecSizes[currVectorCol];
+            currVectorCol++;
+         }
+      }
 
       if (fLoadEager) {
          fDatasetLoader = std::make_unique<RDatasetLoader<Args...>>(fRdfs, fTestSize, fCols, fVecSizes, vecPadding,
@@ -220,6 +238,184 @@ public:
       }
 
       fLoadingThread = std::make_unique<std::thread>(&RDataLoaderEngine::LoadData, this);
+   }
+   void SaveRNTuple(char* rntupleName, std::string savepath, bool isTraining){
+      Activate();
+      if (isTraining){
+         ActivateTrainingEpoch();
+         CreateTrainBatches();
+      }
+      else{
+         ActivateValidationEpoch();
+         CreateValidationBatches();
+      }
+
+      auto model = ROOT::RNTupleModel::Create();
+
+      // One sample batch for the column gathering before the main loop
+      RFlat2DMatrix rf2d;
+      if (isTraining) rf2d = GetTrainBatch();
+      else            rf2d = GetValidationBatch();
+      
+
+      auto vecCols = std::accumulate(fVecSizes.begin(), fVecSizes.end(), 0);
+      std::vector<std::shared_ptr<float>> scalarFields(rf2d.GetCols()-vecCols);
+      std::vector<std::shared_ptr<std::vector<float>>> vectorFields(fVecSizes.size());
+      // std::cout << "rf2d.GetCols(): " + std::to_string(rf2d.GetCols()) + "\n";
+      // std::cout << "fCols length: " + std::to_string(fCols.size()) + "\n";
+      // std::cout << "scalarFields size: " + std::to_string(scalarFields.size()) + "\n";
+      // std::cout << "vectorFields size: " + std::to_string(vectorFields.size()) + "\n";
+      // return;
+
+      auto scalarIndex = 0;
+      auto vectorIndex = 0;
+      for(int col = 0; col < fCols.size(); col++) {
+         // std::cout << "col is: " + std::to_string(col) + "\n";
+         // std::cout << "fCols size is: " + std::to_string(fCols.size()) + "\n";
+         // std::cout << "fCols[col] is: " + fCols[col] + "\n";
+         auto fieldName = fCols[col];
+         if (fVecNamesSizes.find(fieldName) != fVecNamesSizes.end()) { // Vector mode
+            vectorFields[vectorIndex] = model->MakeField<std::vector<float>>(fieldName);
+            vectorIndex++;
+         }
+         else {
+            scalarFields[scalarIndex] = model->MakeField<float>(fieldName);
+            scalarIndex++;
+         }
+      }
+
+      auto writer = ROOT::RNTupleWriter::Recreate(
+         std::move(model),
+         rntupleName,
+         savepath
+      );
+
+      for(std::size_t row = 0; row < rf2d.GetRows(); row++) {
+         scalarIndex = 0;
+         vectorIndex = 0;
+         for(std::size_t col = 0; col < rf2d.GetCols(); col++) {
+            // std::cout << "col: " + std::to_string(col)+"\n";
+            // std::cout << "fCols[col]: " + fCols[col]+"\n";
+            // std::cout << "scalarIndex: " + std::to_string(scalarIndex) + "\nvectorIndex: " + std::to_string(vectorIndex)+"\n";
+            // std::cout << "scalarFields.size(): " + std::to_string(scalarFields.size())+"\nvectorFields.size(): " + std::to_string(vectorFields.size())+"\n";
+            if (fVecNamesSizes.find(fCols[scalarIndex+vectorIndex]) != fVecNamesSizes.end()) { // Vector mode
+               // std::cout << "Entering vector mode\n";
+               auto vecSize = fVecNamesSizes[fCols[scalarIndex+vectorIndex]];
+               auto filler = std::vector<float>(vecSize);
+               for(std::size_t i = 0; i<vecSize; i++){
+                  filler[i] = rf2d.GetData()[row * rf2d.GetCols() + col + i];
+               }
+               *vectorFields[vectorIndex] = filler;
+               col += vecSize - 1;
+               vectorIndex++;
+            }
+            else {
+               *scalarFields[scalarIndex] = rf2d.GetData()[row * rf2d.GetCols() + col];
+               scalarIndex++;
+            }
+         }
+         writer->Fill();
+      }
+      // std::cout << "Entering main loop\n";
+
+      // Main loop for the rest of the batches
+      while(true){
+         if (isTraining) rf2d = GetTrainBatch();
+         else            rf2d = GetValidationBatch();
+         if(!rf2d.GetSize()){
+            break;
+         }
+         for(int row = 0; row < rf2d.GetRows(); row++) {
+            scalarIndex = 0;
+            vectorIndex = 0;
+            for(int col = 0; col < rf2d.GetCols(); col++) {
+               if (fVecNamesSizes.find(fCols[scalarIndex+vectorIndex]) != fVecNamesSizes.end()) { // Vector mode
+                  // std::cout << "Entering vector mode\n";
+                  auto vecSize = fVecNamesSizes[fCols[scalarIndex+vectorIndex]];
+                  auto filler = std::vector<float>(vecSize);
+                  for(int i = 0; i<vecSize; i++){
+                     filler[i] = rf2d.GetData()[row * rf2d.GetCols() + col + i];
+                  }
+                  *vectorFields[vectorIndex] = filler;
+                  col += vecSize - 1;
+                  vectorIndex++;
+               }
+               else {
+                  *scalarFields[scalarIndex] = rf2d.GetData()[row * rf2d.GetCols() + col];
+                  scalarIndex++;
+               }
+            }
+            writer->Fill();
+         }
+      }
+   }
+
+   void Save(char* rntupleName, std::string savepath, bool isTraining)
+   {
+      SaveRNTuple(rntupleName, savepath, isTraining);
+      return;
+      
+      // std::function<RFlat2DMatrix()> GetBatch;
+
+      // Activate(); 
+      // std::cout << "Activated dataloader engine\n";
+      // if(isTraining){
+      //    ActivateTrainingEpoch();
+      //    CreateTrainBatches();
+      //    GetBatch = [this]() {GetTrainBatch();};
+      // }
+      // else {
+      //    ActivateValidationEpoch();
+      //    CreateValidationBatches();
+      //    GetBatch = [this]() {GetValidationBatch();};
+      // }
+      // std::cout << "Activated training epoch\n";
+      
+      // std::cout << "Created training batches\n";
+      
+      // TTree t(rntupleName, "sample title");
+
+      // // One sample batch for the column gathering before the main loop
+      // RFlat2DMatrix rf2d = GetBatch();
+      // // std::cout << rf2d.GetData()[0];
+      // // std::cout << rf2d.fRVec;
+      // // std::cout << rf2d.GetCols();
+      // // std::cout << rf2d.GetRows();
+      // // std::cout << rf2d.GetSize();
+
+
+      // std::vector<float> buffers(rf2d.GetCols());
+      // for(int col = 0; col < rf2d.GetCols(); col++) {
+      //    // const std::string branchName = "col_" + std::to_string(col);
+      //    auto branchName = fCols[col];
+      //    std::cout << fCols[col];
+      //    const std::string leafList = branchName + "/F";
+      //    t.Branch(branchName.c_str(), &buffers[col], leafList.c_str());
+      // }
+
+      // for(int row = 0; row < rf2d.GetRows(); row++) {
+      //    for(int col = 0; col < rf2d.GetCols(); col++) {
+      //       buffers[col] = rf2d.GetData()[row * rf2d.GetRows() + col];
+      //    }
+      //    t.Fill();
+      // }
+
+      // // Main loop for the rest of the batches
+      // while(true){
+      //    rf2d = GetBatch();
+      //    if(!rf2d.GetSize()){
+      //       break;
+      //    }
+      //    for(int row = 0; row < rf2d.GetRows(); row++) {
+      //       for(int col = 0; col < rf2d.GetCols(); col++) {
+      //          buffers[col] = rf2d.GetData()[row * rf2d.GetRows() + col];
+      //       }
+      //       t.Fill();
+      //    }
+      // }
+
+      // ROOT::RDataFrame df(t);
+      // df.Snapshot(rntupleName, savepath);
    }
 
    /// \brief Activate the training epoch by starting the batchloader.

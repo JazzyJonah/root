@@ -484,6 +484,9 @@ class _RDataLoader:
         batch = self.engine.GetTrainBatch()
         return batch if (batch and batch.GetSize() > 0) else None
 
+    def Save(self, treename: str, savepath: str, is_training) -> None:
+        self.engine.Save(treename, savepath, is_training)
+
     def GetValidationBatch(self) -> Any:
         """Return the next training batch of data from the given RDataFrame
 
@@ -772,6 +775,8 @@ class RDataLoader:
 
         loader = FormattedLoader(self._internal, self._internal.ConvertBatchToTF, self._is_training)
         return tf.data.Dataset.from_generator(lambda: loader, output_signature=batch_signature)
+    def save(self, treename, savepath):
+        self._internal.Save(treename, savepath, self._is_training)
 
     def as_jax(self, device: str | Any = None) -> FormattedLoader:
         r"""
